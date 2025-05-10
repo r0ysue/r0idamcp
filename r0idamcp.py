@@ -4,7 +4,7 @@ import asyncio
 import functools
 import logging
 import queue
-from typing import Any, Callable, get_type_hints, TypedDict, Optional, Annotated, TypeVar, Generic
+from typing import Any, Callable, Dict, List, get_type_hints, TypedDict, Optional, Annotated, TypeVar, Generic
 import struct
 import sys
 from pydantic import Field
@@ -21,6 +21,9 @@ import ida_lines
 import ida_xref
 import ida_entry
 import ida_typeinf
+import ida_segment
+import ida_ua
+import ida_bytes
 
 class IDASyncError(Exception):
     pass
@@ -471,32 +474,93 @@ def get_entry_points_real() -> list[Function]:
         if func is not None:
             result.append(func)
     return result
+@idaread
+def get_segments_real() -> List[Dict[str, Any]]:
+    segments = []
+    n = 0
+    seg = ida_segment.getnseg(n)
+    while seg:
+        segments.append(
+            {
+                "start": seg.start_ea,
+                "end": seg.end_ea,
+                "name": ida_segment.get_segm_name(seg),
+                "class": ida_segment.get_segm_class(seg),
+                "perm": seg.perm,
+                "bitness": seg.bitness,
+                "align": seg.align,
+                "comb": seg.comb,
+                "type": seg.type,
+                "sel": seg.sel,
+                "flags": seg.flags,
+            }
+        )
+        n += 1
+        seg = ida_segment.getnseg(n)
+    return segments
+@idaread
+def get_instruction_length_real(address: int) -> int:
+    """
+    Retrieves the length (in bytes) of the instruction at the specified address.
+    Args:
+        address: The address of the instruction.
+    Returns:
+        The length (in bytes) of the instruction.  Returns 0 if the instruction cannot be decoded.
+    """
+    try:
+        # Create an insn_t object to store instruction information.
+        insn = ida_ua.insn_t()
+        # Decode the instruction.
+        length = ida_ua.decode_insn(insn, address)
+        if length == 0:
+            print(f"Failed to decode instruction at address {hex(address)}")
+            return 0
+        return length
+    except Exception as e:
+        print(f"Error getting instruction length: {str(e)}")
+        return 0
+@idaread
+def get_bytes_real(ea: int, size: int) -> List[int]:
+    try:
+        result = [ida_bytes.get_byte(ea + i) for i in range(size)]
+        return result
+    except Exception as e:
+        print(f"Error in get_bytes: {str(e)}")
+        return {"error": str(e)}
 
 @idawrite
 def set_comment_real(
     address: Annotated[str, "Address in the function to set the comment for"],
     comment: Annotated[str, "Comment text"]
-):
-    """Set a comment for a given address in the function disassembly and pseudocode"""
+) -> str:
+    """Set a comment for a given address in the function disassembly and pseudocode
+    
+    Returns:
+        str: Success message if comment was set successfully, or error message if failed
+    """
     address = parse_address(address)
 
+    # Set disassembly comment first
     if not idaapi.set_cmt(address, comment, False):
         raise IDAError(f"Failed to set disassembly comment at {hex(address)}")
+    
+    success_msg = f"Successfully set disassembly comment at {hex(address)}"
 
     # Reference: https://cyber.wtf/2019/03/22/using-ida-python-to-analyze-trickbot/
-    # Check if the address corresponds to a line
+    # Check if the address corresponds to a line in decompiled code
     cfunc = decompile_checked(address)
 
     # Special case for function entry comments
     if address == cfunc.entry_ea:
         idc.set_func_cmt(address, comment, True)
         cfunc.refresh_func_ctext()
-        return
+        return f"{success_msg} and function entry comment"
 
     eamap = cfunc.get_eamap()
     if address not in eamap:
         print(f"Failed to set decompiler comment at {hex(address)}")
-        return
+        return f"{success_msg}, but failed to set decompiler comment (address not in eamap)"
+
     nearest_ea = eamap[address][0].ea
 
     # Remove existing orphan comments
@@ -513,10 +577,12 @@ def set_comment_real(
         cfunc.save_user_cmts()
         cfunc.refresh_func_ctext()
         if not cfunc.has_orphan_cmts():
-            return
+            return f"{success_msg} and decompiler comment"
         cfunc.del_orphan_cmts()
         cfunc.save_user_cmts()
+    
     print(f"Failed to set decompiler comment at {hex(address)}")
+    return f"{success_msg}, but failed to set decompiler comment (all item types tried)"
 
 def refresh_decompiler_widget():
     widget = ida_kernwin.get_current_widget()
@@ -535,15 +601,28 @@ def rename_local_variable_real(
     function_address: Annotated[str, "Address of the function containing the variable"],
     old_name: Annotated[str, "Current name of the variable"],
     new_name: Annotated[str, "New name for the variable (empty for a default name)"]
-):
+) -> str:
     """Rename a local variable in a function"""
     func = idaapi.get_func(parse_address(function_address))
     if not func:
         raise IDAError(f"No function found at address {function_address}")
+    
+    # 获取函数的局部变量列表
+    cfunc = idaapi.decompile(func.start_ea)
+    if not cfunc:
+        raise IDAError(f"Failed to decompile function at address {function_address}")
+    lvars = cfunc.get_lvars()
+    
+    # 检测新变量名是否与已存在的局部变量名重名
+    for lvar in lvars:
+        if lvar.name == new_name:
+            return f"Variable name '{new_name}' already exists in function {hex(func.start_ea)}. Please choose a different name."
+    
     if not ida_hexrays.rename_lvar(func.start_ea, old_name, new_name):
         raise IDAError(f"Failed to rename local variable {old_name} in function {hex(func.start_ea)}")
     refresh_decompiler_ctext(func.start_ea)
-
+    return f"Successfully renamed local variable {old_name} to {new_name} in function {hex(func.start_ea)}"
+    
 class my_modifier_t(ida_hexrays.user_lvar_modifier_t):
     def __init__(self, var_name: str, new_type: ida_typeinf.tinfo_t):
         ida_hexrays.user_lvar_modifier_t.__init__(self)
@@ -685,6 +764,8 @@ def declare_c_type_real(
     return f"success\n\nInfo:\n{pretty_messages}"
 
 
+
+
 # mcp = FastMCP(name="My MCP Server",host=0.0.0.0,port=8888)
 # Configure during initialization
 mcp = FastMCP(name="myServer")
@@ -771,12 +852,12 @@ def get_entry_points() -> list[Function]:
     return get_entry_points_real()
 
 @mcp.tool()
-def set_comment(address: Annotated[str, Field(description='Address in the function to set the comment for')], comment: Annotated[str, Field(description='Comment text')]):
+def set_comment(address: Annotated[str, Field(description='Address in the function to set the comment for')], comment: Annotated[str, Field(description='Comment text')]) -> str:
     """Set a comment for a given address in the function disassembly and pseudocode"""
     return set_comment_real(address, comment)
 
 @mcp.tool()
-def rename_local_variable(function_address: Annotated[str, Field(description='Address of the function containing the variable')], old_name: Annotated[str, Field(description='Current name of the variable')], new_name: Annotated[str, Field(description='New name for the variable (empty for a default name)')]):
+def rename_local_variable(function_address: Annotated[str, Field(description='Address of the function containing the variable')], old_name: Annotated[str, Field(description='Current name of the variable')], new_name: Annotated[str, Field(description='New name for the variable (empty for a default name)')]) -> str:
     """Rename a local variable in a function"""
     return rename_local_variable_real(function_address, old_name, new_name)
 
@@ -809,6 +890,33 @@ def set_function_prototype(function_address: Annotated[str, Field(description='A
 def declare_c_type(c_declaration: Annotated[str, Field(description='C declaration of the type. Examples include: typedef int foo_t; struct bar { int a; bool b; };')]):
     """Create or update a local type from a C declaration"""
     return declare_c_type_real(c_declaration)       
+
+@mcp.tool()
+def get_segments() -> List[Dict[str, Any]]:
+    """Get all segments information.
+    @return: List of segments (start, end, name, class, perm, bitness, align, comb, type, sel, flags)
+    """
+    return get_segments_real()
+@mcp.tool()
+def get_instruction_length(address: int) -> int:
+    """
+    Retrieves the length (in bytes) of the instruction at the specified address.
+    Args:
+        address: The address of the instruction.
+    Returns:
+        The length (in bytes) of the instruction.  Returns 0 if the instruction cannot be decoded.
+    """
+    return get_instruction_length_real(address)
+@mcp.tool()
+def get_bytes(ea: int, size: int) -> List[int]:
+    """Get bytes at specified address.
+
+    Args:
+        ea: Effective address to read from
+        size: Number of bytes to read
+    """
+    return get_bytes_real(ea,size)
+
 def startASYNC():
      asyncio.run(mcp.run_sse_async(host="0.0.0.0", port=26868, log_level="debug"))
 def start_server():
