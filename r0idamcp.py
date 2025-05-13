@@ -474,6 +474,7 @@ def get_entry_points_real() -> list[Function]:
         if func is not None:
             result.append(func)
     return result
+
 @idaread
 def get_segments_real() -> List[Dict[str, Any]]:
     segments = []
@@ -498,15 +499,9 @@ def get_segments_real() -> List[Dict[str, Any]]:
         n += 1
         seg = ida_segment.getnseg(n)
     return segments
+
 @idaread
-def get_instruction_length_real(address: int) -> int:
-    """
-    Retrieves the length (in bytes) of the instruction at the specified address.
-    Args:
-        address: The address of the instruction.
-    Returns:
-        The length (in bytes) of the instruction.  Returns 0 if the instruction cannot be decoded.
-    """
+def get_instruction_length_real(address: int) -> int:    
     try:
         # Create an insn_t object to store instruction information.
         insn = ida_ua.insn_t()
@@ -519,48 +514,39 @@ def get_instruction_length_real(address: int) -> int:
     except Exception as e:
         print(f"Error getting instruction length: {str(e)}")
         return 0
-@idaread
-def get_bytes_real(ea: int, size: int) -> List[int]:
-    try:
-        result = [ida_bytes.get_byte(ea + i) for i in range(size)]
-        return result
-    except Exception as e:
-        print(f"Error in get_bytes: {str(e)}")
-        return {"error": str(e)}
 
 @idawrite
 def set_comment_real(
     address: Annotated[str, "Address in the function to set the comment for"],
     comment: Annotated[str, "Comment text"]
 ) -> str:
-    """Set a comment for a given address in the function disassembly and pseudocode
-    
-    Returns:
-        str: Success message if comment was set successfully, or error message if failed
+    """
+    Set a comment for a given address in the function disassembly and pseudocode.
+    Returns a string indicating whether the comment was set successfully.
     """
     address = parse_address(address)
 
-    # Set disassembly comment first
+    # Set disassembly comment
     if not idaapi.set_cmt(address, comment, False):
         raise IDAError(f"Failed to set disassembly comment at {hex(address)}")
-    
-    success_msg = f"Successfully set disassembly comment at {hex(address)}"
+    else:
+        print(f"Disassembly comment set successfully at {hex(address)}")
 
-    # Reference: https://cyber.wtf/2019/03/22/using-ida-python-to-analyze-trickbot/
-    # Check if the address corresponds to a line in decompiled code
+    # Reference: <url id="d0g71o3djm8p5liq0650" type="url" status="parsed" title="Using IDA Python to analyze Trickbot" wc="14166">https://cyber.wtf/2019/03/22/using-ida-python-to-analyze-trickbot/</url> 
+    # Check if the address corresponds to a line
     cfunc = decompile_checked(address)
 
     # Special case for function entry comments
     if address == cfunc.entry_ea:
         idc.set_func_cmt(address, comment, True)
         cfunc.refresh_func_ctext()
-        return f"{success_msg} and function entry comment"
+        return "Comment set successfully for function entry"
 
     eamap = cfunc.get_eamap()
     if address not in eamap:
         print(f"Failed to set decompiler comment at {hex(address)}")
-        return f"{success_msg}, but failed to set decompiler comment (address not in eamap)"
-
+        return "Failed to set decompiler comment"
+    
     nearest_ea = eamap[address][0].ea
 
     # Remove existing orphan comments
@@ -577,12 +563,11 @@ def set_comment_real(
         cfunc.save_user_cmts()
         cfunc.refresh_func_ctext()
         if not cfunc.has_orphan_cmts():
-            return f"{success_msg} and decompiler comment"
+            return "Comment set successfully"
         cfunc.del_orphan_cmts()
         cfunc.save_user_cmts()
-    
     print(f"Failed to set decompiler comment at {hex(address)}")
-    return f"{success_msg}, but failed to set decompiler comment (all item types tried)"
+    return "Failed to set decompiler comment"
 
 def refresh_decompiler_widget():
     widget = ida_kernwin.get_current_widget()
@@ -602,27 +587,40 @@ def rename_local_variable_real(
     old_name: Annotated[str, "Current name of the variable"],
     new_name: Annotated[str, "New name for the variable (empty for a default name)"]
 ) -> str:
-    """Rename a local variable in a function"""
+    """Rename a local variable in a function with name conflict checking
+    
+    Returns:
+        str: Success message if successful, error message if failed or name conflict exists
+    """
     func = idaapi.get_func(parse_address(function_address))
     if not func:
-        raise IDAError(f"No function found at address {function_address}")
+        return f"Error: No function found at address {function_address}"
     
-    # 获取函数的局部变量列表
-    cfunc = idaapi.decompile(func.start_ea)
+    # Check if new_name is empty (will use default name)
+    if not new_name:
+        if not ida_hexrays.rename_lvar(func.start_ea, old_name, new_name):
+            return f"Error: Failed to rename local variable {old_name} in function {hex(func.start_ea)}"
+        refresh_decompiler_ctext(func.start_ea)
+        return f"Success: Local variable '{old_name}' renamed to default name in function {hex(func.start_ea)}"
+    
+    # Get decompilation of the function
+    cfunc = ida_hexrays.decompile(func.start_ea)
     if not cfunc:
-        raise IDAError(f"Failed to decompile function at address {function_address}")
+        return f"Error: Failed to decompile function at {hex(func.start_ea)}"
+    
+    # Check for name conflicts
     lvars = cfunc.get_lvars()
-    
-    # 检测新变量名是否与已存在的局部变量名重名
     for lvar in lvars:
-        if lvar.name == new_name:
-            return f"Variable name '{new_name}' already exists in function {hex(func.start_ea)}. Please choose a different name."
+        if lvar.name == new_name and lvar.name != old_name:
+            return f"Error: Variable name '{new_name}' already exists in function {hex(func.start_ea)}"
     
+    # Perform the rename
     if not ida_hexrays.rename_lvar(func.start_ea, old_name, new_name):
-        raise IDAError(f"Failed to rename local variable {old_name} in function {hex(func.start_ea)}")
-    refresh_decompiler_ctext(func.start_ea)
-    return f"Successfully renamed local variable {old_name} to {new_name} in function {hex(func.start_ea)}"
+        return f"Error: Failed to rename local variable {old_name} in function {hex(func.start_ea)}"
     
+    refresh_decompiler_ctext(func.start_ea)
+    return f"Success: Local variable '{old_name}' renamed to '{new_name}' in function {hex(func.start_ea)}"
+
 class my_modifier_t(ida_hexrays.user_lvar_modifier_t):
     def __init__(self, var_name: str, new_type: ida_typeinf.tinfo_t):
         ida_hexrays.user_lvar_modifier_t.__init__(self)
@@ -642,8 +640,13 @@ def set_local_variable_type_real(
     function_address: Annotated[str, "Address of the function containing the variable"],
     variable_name: Annotated[str, "Name of the variable"],
     new_type: Annotated[str, "New type for the variable"]
-):
-    """Set a local variable's type"""
+) -> str:
+    """Set a local variable's type
+    
+    Returns:
+        str: Success message with function address, variable name and new type
+    """
+    # Parse the new type
     try:
         # Some versions of IDA don't support this constructor
         new_tif = ida_typeinf.tinfo_t(new_type, None, ida_typeinf.PT_SIL)
@@ -653,33 +656,39 @@ def set_local_variable_type_real(
             # parse_decl requires semicolon for the type
             ida_typeinf.parse_decl(new_tif, None, new_type+";", ida_typeinf.PT_SIL)
         except Exception:
-            raise IDAError(f"Failed to parse type: {new_type}")
+            raise IDAError(f"Failed to parse type: {new_type}")    
+    # Get the function
     func = idaapi.get_func(parse_address(function_address))
     if not func:
         raise IDAError(f"No function found at address {function_address}")
+    # Rename (this is needed to find the variable)
     if not ida_hexrays.rename_lvar(func.start_ea, variable_name, variable_name):
-        raise IDAError(f"Failed to find local variable: {variable_name}")
+        raise IDAError(f"Failed to find local variable: {variable_name}")    
+    # Apply the type change
     modifier = my_modifier_t(variable_name, new_tif)
     if not ida_hexrays.modify_user_lvars(func.start_ea, modifier):
-        raise IDAError(f"Failed to modify local variable: {variable_name}")
-    refresh_decompiler_ctext(func.start_ea)
-
+        raise IDAError(f"Failed to modify local variable: {variable_name}")    
+    refresh_decompiler_ctext(func.start_ea)    
+    return (f"Successfully changed type of variable '{variable_name}' "
+            f"in function at {hex(func.start_ea)} "
+            f"to '{new_type}'")
 
 @idawrite
 def rename_global_variable_real(
     old_name: Annotated[str, "Current name of the global variable"],
     new_name: Annotated[str, "New name for the global variable (empty for a default name)"]
-):
+) -> str:
     """Rename a global variable"""
     ea = idaapi.get_name_ea(idaapi.BADADDR, old_name)
     if not idaapi.set_name(ea, new_name):
         raise IDAError(f"Failed to rename global variable {old_name} to {new_name}")
     refresh_decompiler_ctext(ea)
+    return f"Success: global variable '{old_name}' renamed to '{new_name}' in function {hex(ea)}"
 @idawrite
 def set_global_variable_type_real(
     variable_name: Annotated[str, "Name of the global variable"],
     new_type: Annotated[str, "New type for the variable"]
-):
+) -> str:
     """Set a global variable's type"""
     ea = idaapi.get_name_ea(idaapi.BADADDR, variable_name)
     tif = ida_typeinf.tinfo_t(new_type, None, ida_typeinf.PT_SIL)
@@ -687,18 +696,33 @@ def set_global_variable_type_real(
         raise IDAError(f"Parsed declaration is not a variable type")
     if not ida_typeinf.apply_tinfo(ea, tif, ida_typeinf.PT_SIL):
         raise IDAError(f"Failed to apply type")
+    return (f"Successfully changed type of variable '{variable_name}' "
+            f"in function at {hex(ea)} "
+            f"to '{new_type}'")
 @idawrite
 def rename_function_real(
     function_address: Annotated[str, "Address of the function to rename"],
     new_name: Annotated[str, "New name for the function (empty for a default name)"]
-):
-    """Rename a function"""
+) -> str:
+    """Rename a function
+    
+    Returns:
+        str: Success message with the old and new function names
+    """
     func = idaapi.get_func(parse_address(function_address))
     if not func:
         raise IDAError(f"No function found at address {function_address}")
+    
+    old_name = idaapi.get_name(func.start_ea)
     if not idaapi.set_name(func.start_ea, new_name):
         raise IDAError(f"Failed to rename function {hex(func.start_ea)} to {new_name}")
+    
     refresh_decompiler_ctext(func.start_ea)
+    
+    # Get the actual new name (in case an empty string was provided and IDA chose a default)
+    actual_new_name = idaapi.get_name(func.start_ea)
+    
+    return f"Successfully renamed function from '{old_name}' to '{actual_new_name}' at {hex(func.start_ea)}"
 @idawrite
 def set_function_prototype_real(
     function_address: Annotated[str, "Address of the function"],
@@ -762,8 +786,6 @@ def declare_c_type_real(
     if errors > 0:
         raise IDAError(f"Failed to parse type:\n{c_declaration}\n\nErrors:\n{pretty_messages}")
     return f"success\n\nInfo:\n{pretty_messages}"
-
-
 
 
 # mcp = FastMCP(name="My MCP Server",host=0.0.0.0,port=8888)
@@ -852,32 +874,32 @@ def get_entry_points() -> list[Function]:
     return get_entry_points_real()
 
 @mcp.tool()
-def set_comment(address: Annotated[str, Field(description='Address in the function to set the comment for')], comment: Annotated[str, Field(description='Comment text')]) -> str:
+def set_comment(address: Annotated[str, Field(description='Address in the function to set the comment for')], comment: Annotated[str, Field(description='Comment text')])-> str:
     """Set a comment for a given address in the function disassembly and pseudocode"""
     return set_comment_real(address, comment)
 
 @mcp.tool()
-def rename_local_variable(function_address: Annotated[str, Field(description='Address of the function containing the variable')], old_name: Annotated[str, Field(description='Current name of the variable')], new_name: Annotated[str, Field(description='New name for the variable (empty for a default name)')]) -> str:
+def rename_local_variable(function_address: Annotated[str, Field(description='Address of the function containing the variable')], old_name: Annotated[str, Field(description='Current name of the variable')], new_name: Annotated[str, Field(description='New name for the variable (empty for a default name)')])-> str:
     """Rename a local variable in a function"""
     return rename_local_variable_real(function_address, old_name, new_name)
 
 @mcp.tool()
-def set_local_variable_type(function_address: Annotated[str, Field(description='Address of the function containing the variable')], variable_name: Annotated[str, Field(description='Name of the variable')], new_type: Annotated[str, Field(description='New type for the variable')]):
+def set_local_variable_type(function_address: Annotated[str, Field(description='Address of the function containing the variable')], variable_name: Annotated[str, Field(description='Name of the variable')], new_type: Annotated[str, Field(description='New type for the variable')])-> str:
     """Set a local variable's type"""
     return set_local_variable_type_real(function_address, variable_name, new_type)
 
 @mcp.tool()
-def rename_global_variable(old_name: Annotated[str, Field(description='Current name of the global variable')], new_name: Annotated[str, Field(description='New name for the global variable (empty for a default name)')]):
+def rename_global_variable(old_name: Annotated[str, Field(description='Current name of the global variable')], new_name: Annotated[str, Field(description='New name for the global variable (empty for a default name)')]) -> str:
     """Rename a global variable"""
     return rename_global_variable_real(old_name, new_name)
 
 @mcp.tool()
-def set_global_variable_type(variable_name: Annotated[str, Field(description='Name of the global variable')], new_type: Annotated[str, Field(description='New type for the variable')]):
+def set_global_variable_type(variable_name: Annotated[str, Field(description='Name of the global variable')], new_type: Annotated[str, Field(description='New type for the variable')]) -> str:
     """Set a global variable's type"""
     return set_global_variable_type_real(variable_name, new_type)
 
 @mcp.tool()
-def rename_function(function_address: Annotated[str, Field(description='Address of the function to rename')], new_name: Annotated[str, Field(description='New name for the function (empty for a default name)')]):
+def rename_function(function_address: Annotated[str, Field(description='Address of the function to rename')], new_name: Annotated[str, Field(description='New name for the function (empty for a default name)')])-> str:
     """Rename a function"""
     return rename_function_real(function_address, new_name)
 
@@ -897,6 +919,7 @@ def get_segments() -> List[Dict[str, Any]]:
     @return: List of segments (start, end, name, class, perm, bitness, align, comb, type, sel, flags)
     """
     return get_segments_real()
+
 @mcp.tool()
 def get_instruction_length(address: int) -> int:
     """
@@ -907,15 +930,21 @@ def get_instruction_length(address: int) -> int:
         The length (in bytes) of the instruction.  Returns 0 if the instruction cannot be decoded.
     """
     return get_instruction_length_real(address)
+
 @mcp.tool()
+@idaread
 def get_bytes(ea: int, size: int) -> List[int]:
     """Get bytes at specified address.
-
     Args:
         ea: Effective address to read from
         size: Number of bytes to read
     """
-    return get_bytes_real(ea,size)
+    try:
+        result = [ida_bytes.get_byte(ea + i) for i in range(size)]
+        return result
+    except Exception as e:
+        print(f"Error in get_bytes: {str(e)}")
+        return {"error": str(e)}
 
 def startASYNC():
      asyncio.run(mcp.run_sse_async(host="0.0.0.0", port=26868, log_level="debug"))
